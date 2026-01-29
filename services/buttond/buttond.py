@@ -1,13 +1,30 @@
-from gpiozero import Button
-from signal import pause
+import Jetson.GPIO as GPIO
 import time
 
-PIN = 17  # GPIO17 (physical pin 11)
-btn = Button(PIN, pull_up=True, bounce_time=0.03)
+# BOARD pin numbers
+BUTTON_PIN = 11  # J41 pin 11 (GPIO17)
 
-def on_press():
-    print(f"[buttond] button down @ {time.time():.3f}", flush=True)
+def main():
+    # Use physical pin numbering
+    GPIO.setmode(GPIO.BOARD)
 
-btn.when_pressed = on_press
-print("[buttond] running. press button to print.", flush=True)
-pause()
+    # Button as input with pull-up
+    GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+    print("[buttond] started, waiting for button press", flush=True)
+
+    try:
+        while True:
+            # Wait for falling edge (button pressed)
+            GPIO.wait_for_edge(BUTTON_PIN, GPIO.FALLING)
+
+            print("[buttond] button down", flush=True)
+
+            # Simple debounce
+            time.sleep(0.2)
+
+    finally:
+        GPIO.cleanup()
+
+if __name__ == "__main__":
+    main()
