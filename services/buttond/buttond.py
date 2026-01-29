@@ -1,4 +1,4 @@
-cat > ~/projects/robot-dog-jetson/services/buttond/buttond.py << 'EOF'
+cat << 'EOF' > /home/tatu/projects/robot-dog-jetson/services/buttond/buttond.py
 import Jetson.GPIO as GPIO
 import time
 
@@ -6,7 +6,7 @@ BUTTON_PIN = 11  # BOARD pin 11 (J41)
 
 def main():
     GPIO.setmode(GPIO.BOARD)
-    GPIO.setup(BUTTON_PIN, GPIO.IN)  # no pull_up_down (ignored anyway)
+    GPIO.setup(BUTTON_PIN, GPIO.IN)
 
     print("[buttond] started, waiting for button press", flush=True)
 
