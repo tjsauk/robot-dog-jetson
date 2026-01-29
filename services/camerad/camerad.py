@@ -1,4 +1,3 @@
-cat << 'EOF' > /home/tatu/projects/robot-dog-jetson/services/camerad/camerad.py
 import os
 import time
 import threading
@@ -231,4 +230,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-EOF

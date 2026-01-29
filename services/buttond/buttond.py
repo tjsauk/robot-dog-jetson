@@ -1,4 +1,3 @@
-cat << 'EOF' > /home/tatu/projects/robot-dog-jetson/services/buttond/buttond.py
 import Jetson.GPIO as GPIO
 import time
 
@@ -20,4 +19,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-EOF
+
