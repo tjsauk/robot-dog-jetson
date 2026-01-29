@@ -12,6 +12,7 @@ FPS = int(os.environ.get("CAM_FPS", "30"))
 CAP_W = int(os.environ.get("CAM_W", "1920"))
 CAP_H = int(os.environ.get("CAM_H", "1080"))
 DOWNSAMPLE = int(os.environ.get("CAM_DOWNSAMPLE", "1"))
+DEBUG = os.environ.get("CAM_DEBUG", "0") == "1"
 
 STOP = threading.Event()
 
@@ -33,20 +34,45 @@ class LatestStore:
         self.R = None
         self.lc = 0
         self.rc = 0
+        self.dt_ms = None        # latest (L.pts - R.pts) in ms
+        self.dt_pts_ns = None    # same delta in ns
 
     def set_L(self, fr):
         with self._lock:
             self.L = fr
             self.lc += 1
+            if self.R is not None:
+                self.dt_pts_ns = self.L.pts_ns - self.R.pts_ns
+                self.dt_ms = self.dt_pts_ns / 1e6
 
     def set_R(self, fr):
         with self._lock:
             self.R = fr
             self.rc += 1
+            if self.L is not None:
+                self.dt_pts_ns = self.L.pts_ns - self.R.pts_ns
+                self.dt_ms = self.dt_pts_ns / 1e6
 
-    def get(self):
+    def get_latest(self):
+        # Returns frames + counters + dt in a single lock for consistency
         with self._lock:
-            return self.L, self.R, self.lc, self.rc
+            return self.L, self.R, self.lc, self.rc, self.dt_ms
+
+    def get_status(self):
+        # Cheap status snapshot (no frame bytes)
+        with self._lock:
+            have_L = self.L is not None
+            have_R = self.R is not None
+            return {
+                "have_L": have_L,
+                "have_R": have_R,
+                "lc": self.lc,
+                "rc": self.rc,
+                "dt_ms": self.dt_ms,
+                "w": self.L.w if have_L else None,
+                "h": self.L.h if have_L else None,
+                "ds": self.L.ds if have_L else None,
+            }
 
 store = LatestStore()
 
@@ -89,8 +115,7 @@ def downsample_nv12(y, uv, w, h, ds):
     return bytes(y_out), bytes(uv_out), nw, nh
 
 def make_pipeline(sensor_id):
-    # Minimal latency: keep only newest, drop old.
-    # NV12 only (no RGB/BGR conversion)
+    # Minimal latency: keep only newest, drop old. NV12 only.
     desc = (
         f"nvarguscamerasrc sensor-id={sensor_id} ! "
         f"video/x-raw(memory:NVMM),width={CAP_W},height={CAP_H},format=NV12,framerate={FPS}/1 ! "
@@ -103,6 +128,9 @@ def camera_thread(sensor_id, is_left):
     pipeline = make_pipeline(sensor_id)
     sink = pipeline.get_by_name("sink")
     pipeline.set_state(Gst.State.PLAYING)
+
+    if DEBUG:
+        print(f"[camerad] cam{sensor_id} started", flush=True)
 
     try:
         while not STOP.is_set():
@@ -138,25 +166,21 @@ def camera_thread(sensor_id, is_left):
         pipeline.set_state(Gst.State.NULL)
 
 def main():
-    # Start as close together as possible
     t0 = threading.Thread(target=camera_thread, args=(0, True))
     t1 = threading.Thread(target=camera_thread, args=(1, False))
     t0.start()
     t1.start()
 
-    print(f"[camerad] LATEST NV12 {CAP_W}x{CAP_H}@{FPS} ds={DOWNSAMPLE} (max-buffers=1 drop=true)", flush=True)
+    if DEBUG:
+        print(f"[camerad] LATEST NV12 {CAP_W}x{CAP_H}@{FPS} ds={DOWNSAMPLE}", flush=True)
 
-    last_lc = last_rc = 0
     try:
+        # Quiet keep-alive loop. Other services will read store via IPC later.
         while True:
-            L, R, lc, rc = store.get()
-            if L is None or R is None:
-                print("[camerad] waiting for both cameras...", flush=True)
-            else:
-                dt_ms = (L.pts_ns - R.pts_ns) / 1e6
-                print(f"[camerad] +L{lc-last_lc} +R{rc-last_rc} dt={dt_ms:.2f}ms", flush=True)
-                last_lc, last_rc = lc, rc
-            time.sleep(2)
+            if DEBUG:
+                st = store.get_status()
+                print(f"[camerad] status {st}", flush=True)
+            time.sleep(1 if DEBUG else 10)
     except KeyboardInterrupt:
         STOP.set()
         t0.join(timeout=1.0)
