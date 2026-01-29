@@ -107,8 +107,10 @@ def make_factory(sensor_id, side_tag):
         f"video/x-raw(memory:NVMM),width={W},height={H},format=NV12,framerate={FPS}/1 ! "
         f"nvvidconv ! video/x-raw,format=NV12,width={W},height={H} ! "
         f"tee name=t "
-        f"t. ! queue ! appsink name=appsink_{side_tag} emit-signals=true sync=false max-buffers=1 drop=true "
-        f"t. ! queue ! nvv4l2h264enc bitrate={BITRATE} insert-sps-pps=true iframeinterval={FPS} ! "
+        f"t. ! queue leaky=downstream max-size-buffers=1 ! "
+        f"appsink name=appsink_{side_tag} emit-signals=true sync=false max-buffers=1 drop=true "
+        f"t. ! queue leaky=downstream max-size-buffers=4 ! "
+        f"nvv4l2h264enc bitrate={BITRATE} insert-sps-pps=true iframeinterval={FPS} ! "
         f"h264parse ! rtph264pay name=pay0 pt=96 config-interval=1 )"
     )
     factory.set_launch(launch)
