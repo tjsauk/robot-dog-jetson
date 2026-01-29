@@ -1,7 +1,6 @@
 import os
 import time
 import threading
-from collections import deque
 
 import gi
 gi.require_version("Gst", "1.0")
@@ -12,9 +11,7 @@ Gst.init(None)
 FPS = int(os.environ.get("CAM_FPS", "30"))
 CAP_W = int(os.environ.get("CAM_W", "1920"))
 CAP_H = int(os.environ.get("CAM_H", "1080"))
-DOWNSAMPLE = int(os.environ.get("CAM_DOWNSAMPLE", "2"))
-SYNC_TOL_MS = float(os.environ.get("CAM_SYNC_TOL_MS", "10.0"))
-RING = int(os.environ.get("CAM_RING", "12"))  # frames kept per camera
+DOWNSAMPLE = int(os.environ.get("CAM_DOWNSAMPLE", "1"))
 
 STOP = threading.Event()
 
@@ -29,7 +26,32 @@ class Nv12Frame:
         self.y = y
         self.uv = uv
 
+class LatestStore:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.L = None
+        self.R = None
+        self.lc = 0
+        self.rc = 0
+
+    def set_L(self, fr):
+        with self._lock:
+            self.L = fr
+            self.lc += 1
+
+    def set_R(self, fr):
+        with self._lock:
+            self.R = fr
+            self.rc += 1
+
+    def get(self):
+        with self._lock:
+            return self.L, self.R, self.lc, self.rc
+
+store = LatestStore()
+
 def downsample_nv12(y, uv, w, h, ds):
+    # pure pixel skipping; stays NV12
     if ds <= 1:
         return bytes(y), bytes(uv), w, h
 
@@ -66,59 +88,13 @@ def downsample_nv12(y, uv, w, h, ds):
 
     return bytes(y_out), bytes(uv_out), nw, nh
 
-class RingStore:
-    def __init__(self, maxlen):
-        self._lock = threading.Lock()
-        self.L = deque(maxlen=maxlen)
-        self.R = deque(maxlen=maxlen)
-        self.lc = 0
-        self.rc = 0
-
-    def push_L(self, fr):
-        with self._lock:
-            self.L.append(fr)
-            self.lc += 1
-
-    def push_R(self, fr):
-        with self._lock:
-            self.R.append(fr)
-            self.rc += 1
-
-    def best_pair(self):
-        """Return (Lframe, Rframe, dt_ms, lc, rc) using closest pts."""
-        with self._lock:
-            if not self.L or not self.R:
-                return None
-
-            # Copy to avoid holding lock while searching
-            L = list(self.L)
-            R = list(self.R)
-            lc, rc = self.lc, self.rc
-
-        best = None
-        best_abs = None
-
-        # Two-pointer style search could be done if sorted; deques are in time order.
-        j = 0
-        for lf in L:
-            while j + 1 < len(R) and abs((lf.pts_ns - R[j+1].pts_ns)) <= abs((lf.pts_ns - R[j].pts_ns)):
-                j += 1
-            dt_ns = lf.pts_ns - R[j].pts_ns
-            a = abs(dt_ns)
-            if best_abs is None or a < best_abs:
-                best_abs = a
-                best = (lf, R[j], dt_ns / 1e6, lc, rc)
-
-        return best
-
-store = RingStore(RING)
-
 def make_pipeline(sensor_id):
-    # NV12 direct; appsink in system memory (minimal necessary to access bytes)
+    # Minimal latency: keep only newest, drop old.
+    # NV12 only (no RGB/BGR conversion)
     desc = (
         f"nvarguscamerasrc sensor-id={sensor_id} ! "
         f"video/x-raw(memory:NVMM),width={CAP_W},height={CAP_H},format=NV12,framerate={FPS}/1 ! "
-        f"nvvidconv ! video/x-raw,width={CAP_W},height={CAP_H},format=NV12 ! "
+        f"nvvidconv ! video/x-raw,format=NV12,width={CAP_W},height={CAP_H} ! "
         f"appsink name=sink emit-signals=true sync=false max-buffers=1 drop=true"
     )
     return Gst.parse_launch(desc)
@@ -151,43 +127,40 @@ def camera_thread(sensor_id, is_left):
                 uv = data[w * h:w * h + (w * h // 2)]
                 yds, uvds, nw, nh = downsample_nv12(y, uv, w, h, DOWNSAMPLE)
                 fr = Nv12Frame(pts, time.time(), nw, nh, DOWNSAMPLE, yds, uvds)
+
                 if is_left:
-                    store.push_L(fr)
+                    store.set_L(fr)
                 else:
-                    store.push_R(fr)
+                    store.set_R(fr)
             finally:
                 buf.unmap(mapinfo)
-
     finally:
         pipeline.set_state(Gst.State.NULL)
 
 def main():
-    threading.Thread(target=camera_thread, args=(0, True), daemon=True).start()
-    threading.Thread(target=camera_thread, args=(1, False), daemon=True).start()
+    # Start as close together as possible
+    t0 = threading.Thread(target=camera_thread, args=(0, True))
+    t1 = threading.Thread(target=camera_thread, args=(1, False))
+    t0.start()
+    t1.start()
 
-    print(f"[camerad] NV12 ring-sync. {CAP_W}x{CAP_H}@{FPS} ds={DOWNSAMPLE} ring={RING} tol={SYNC_TOL_MS}ms", flush=True)
+    print(f"[camerad] LATEST NV12 {CAP_W}x{CAP_H}@{FPS} ds={DOWNSAMPLE} (max-buffers=1 drop=true)", flush=True)
 
     last_lc = last_rc = 0
-    while True:
-        best = store.best_pair()
-        if best is None:
-            print("[camerad] waiting for cameras...", flush=True)
-            time.sleep(1)
-            continue
-
-        lf, rf, dt_ms, lc, rc = best
-        dl = lc - last_lc
-        dr = rc - last_rc
-        last_lc, last_rc = lc, rc
-
-        synced = abs(dt_ms) <= SYNC_TOL_MS
-        print(f"[camerad] +L{dl} +R{dr} pts_dt={dt_ms:.2f}ms synced={synced}", flush=True)
-
-        time.sleep(2)
-
-if __name__ == "__main__":
     try:
-        main()
+        while True:
+            L, R, lc, rc = store.get()
+            if L is None or R is None:
+                print("[camerad] waiting for both cameras...", flush=True)
+            else:
+                dt_ms = (L.pts_ns - R.pts_ns) / 1e6
+                print(f"[camerad] +L{lc-last_lc} +R{rc-last_rc} dt={dt_ms:.2f}ms", flush=True)
+                last_lc, last_rc = lc, rc
+            time.sleep(2)
     except KeyboardInterrupt:
         STOP.set()
-        time.sleep(0.5)
+        t0.join(timeout=1.0)
+        t1.join(timeout=1.0)
+
+if __name__ == "__main__":
+    main()
