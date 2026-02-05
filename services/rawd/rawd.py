@@ -32,6 +32,12 @@ PREVIEW_DS = int(os.environ.get("RAWD_PREVIEW_DS", "4"))
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
+def monotonic_ns():
+    # Python < 3.7 doesn't have time.monotonic_ns()
+    if hasattr(time, "monotonic_ns"):
+        return time.monotonic_ns()
+    return int(time.monotonic() * 1e9)
+
 # ---------------------------
 # Storage
 # ---------------------------
@@ -65,7 +71,7 @@ class LatestRawPair:
 
     def set_ui_in(self, payload: bytes):
         with self._lock:
-            self.ui_in = {"t_mono_ns": time.monotonic_ns(), "data": payload}
+            self.ui_in = {"t_mono_ns": monotonic_ns(), "data": payload}
 
     def get_ui_in(self):
         with self._lock:
@@ -73,7 +79,7 @@ class LatestRawPair:
 
     def set_teensy_in(self, payload: bytes):
         with self._lock:
-            self.teensy_in = {"t_mono_ns": time.monotonic_ns(), "data": payload}
+            self.teensy_in = {"t_mono_ns": monotonic_ns(), "data": payload}
 
     def get_teensy_in(self):
         with self._lock:
@@ -159,14 +165,14 @@ def capture_pair(now: bool = True):
     Protected with a lock so multiple clients don't collide.
     """
     with _capture_lock:
-        t0 = time.monotonic_ns()
+        t0 = monotonic_ns()
         baseL = os.path.join(TMPDIR, "rawd_cam0")
         baseR = os.path.join(TMPDIR, "rawd_cam1")
 
         rc0, out0 = _capture_one(0, baseL)
-        tL = time.monotonic_ns()
+        tL = monotonic_ns()
         rc1, out1 = _capture_one(1, baseR)
-        tR = time.monotonic_ns()
+        tR = monotonic_ns()
 
         # If capture failed, raise a useful error
         if rc0 != 0 or rc1 != 0:
@@ -189,7 +195,7 @@ def capture_pair(now: bool = True):
             "t_mono_ns": tR, "t_wall": time.time(),
             "raw16": rawR,
         })
-        return (time.monotonic_ns() - t0) / 1e9
+        return (monotonic_ns() - t0) / 1e9
 
 # ---------------------------
 # HTTP API
