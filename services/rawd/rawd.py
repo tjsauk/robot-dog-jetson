@@ -5,7 +5,9 @@ import json
 import struct
 import threading
 import subprocess
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+
 from urllib.parse import urlparse, parse_qs
 
 # ---------------------------
@@ -26,6 +28,9 @@ CAP_TIMEOUT_S = float(os.environ.get("RAWD_TIMEOUT_S", "5.0"))
 
 # Preview downsample factor (RAW only, pixel skipping)
 PREVIEW_DS = int(os.environ.get("RAWD_PREVIEW_DS", "4"))
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
 
 # ---------------------------
 # Storage
