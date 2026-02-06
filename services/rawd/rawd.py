@@ -118,54 +118,21 @@ def _capture_one(sensor_id: int, basepath: str):
     return p.returncode, p.stdout
 
 def _read_raw_plane(raw_path: str):
-    w, h = CAM_W, CAM_H
+    img_bytes = CAM_W * CAM_H * 2      # 4147200 for 1920x1080
+    tail_bytes = 13056                 # hardcoded from your measurements
 
     with open(raw_path, "rb") as f:
         data = f.read()
 
-    if len(data) < w * h * 2:
-        raise RuntimeError(f"RAW file too small: {len(data)} < {w*h*2}")
+    if len(data) < img_bytes:
+        raise RuntimeError(f"RAW too small: {len(data)} < {img_bytes}")
 
-    # Interpret as u16 words
-    total_words = len(data) // 2
+    # Optional: assert exact expected size (helps catch regressions)
+    if len(data) != img_bytes + tail_bytes:
+        print(f"[rawd] WARN: raw size {len(data)} != expected {img_bytes + tail_bytes}")
 
-    # Find plausible stride (in words) where:
-    #   stride*h words are image payload
-    #   remaining tail is "embedded" and is reasonably small
-    candidates = []
-    for stride in range(w, w + 1024):
-        used = stride * h
-        if used > total_words:
-            break
-        tail = total_words - used
-        # tail typically ~ 13056 bytes => 6528 words (but can vary)
-        # allow a generous but bounded window
-        if 0 <= tail <= 20000:  # words
-            candidates.append((stride, tail))
+    return data[:img_bytes]  
 
-    if not candidates:
-        # fallback: assume tight and ignore tail
-        print(f"[rawd] WARNING: could not infer stride, assuming tight plane.")
-        return data[:w*h*2]
-
-    # Pick the candidate with the smallest tail (often the correct one)
-    stride, tail = min(candidates, key=lambda x: x[1])
-
-    stride_bytes = stride * 2
-    tail_bytes = tail * 2
-
-    print(f"[rawd] {os.path.basename(raw_path)} inferred stride={stride} words "
-          f"({stride_bytes} bytes/row), tail={tail_bytes} bytes, file={len(data)} bytes")
-
-    # Pack tight plane row-by-row
-    out = bytearray(w * h * 2)
-    oi = 0
-    for r in range(h):
-        rb = r * stride_bytes
-        out[oi:oi + w*2] = data[rb:rb + w*2]
-        oi += w * 2
-
-    return bytes(out)
 
 
 def _downsample_raw16(plane: bytes, ds: int):
@@ -316,6 +283,8 @@ class Handler(BaseHTTPRequestHandler):
                 "dt_ms": dt_ms,
                 "L": {"w": CAM_W, "h": CAM_H, "t_mono_ns": L["t_mono_ns"], "len": len(L["raw16"])},
                 "R": {"w": CAM_W, "h": CAM_H, "t_mono_ns": R["t_mono_ns"], "len": len(R["raw16"])},
+                "embedded_tail_bytes": 13056,
+                "embedded_top_lines": 6,
             }
             hbytes = json.dumps(header).encode("utf-8")
             payload = L["raw16"] + R["raw16"]
