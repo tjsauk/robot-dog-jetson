@@ -118,17 +118,55 @@ def _capture_one(sensor_id: int, basepath: str):
     return p.returncode, p.stdout
 
 def _read_raw_plane(raw_path: str):
-    # Actual image plane size (16-bit container)
-    img_bytes = CAM_W * CAM_H * 2
+    w, h = CAM_W, CAM_H
 
     with open(raw_path, "rb") as f:
         data = f.read()
 
-    if len(data) < img_bytes:
-        raise RuntimeError(f"RAW file too small: {len(data)} < {img_bytes}")
+    if len(data) < w * h * 2:
+        raise RuntimeError(f"RAW file too small: {len(data)} < {w*h*2}")
 
-    plane = data[:img_bytes]  # ignore embedded tail
-    return plane
+    # Interpret as u16 words
+    total_words = len(data) // 2
+
+    # Find plausible stride (in words) where:
+    #   stride*h words are image payload
+    #   remaining tail is "embedded" and is reasonably small
+    candidates = []
+    for stride in range(w, w + 1024):
+        used = stride * h
+        if used > total_words:
+            break
+        tail = total_words - used
+        # tail typically ~ 13056 bytes => 6528 words (but can vary)
+        # allow a generous but bounded window
+        if 0 <= tail <= 20000:  # words
+            candidates.append((stride, tail))
+
+    if not candidates:
+        # fallback: assume tight and ignore tail
+        print(f"[rawd] WARNING: could not infer stride, assuming tight plane.")
+        return data[:w*h*2]
+
+    # Pick the candidate with the smallest tail (often the correct one)
+    stride, tail = min(candidates, key=lambda x: x[1])
+
+    stride_bytes = stride * 2
+    tail_bytes = tail * 2
+
+    print(f"[rawd] {os.path.basename(raw_path)} inferred stride={stride} words "
+          f"({stride_bytes} bytes/row), tail={tail_bytes} bytes, file={len(data)} bytes")
+
+    # Pack tight plane row-by-row
+    out = bytearray(w * h * 2)
+    oi = 0
+    for r in range(h):
+        rb = r * stride_bytes
+        out[oi:oi + w*2] = data[rb:rb + w*2]
+        oi += w * 2
+
+    return bytes(out)
+
 
 def _downsample_raw16(plane: bytes, ds: int):
     """
