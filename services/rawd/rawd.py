@@ -112,7 +112,7 @@ def _capture_one(sensor_id: int, basepath: str):
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
+        universal_newlines=True,
         timeout=CAP_TIMEOUT_S,
     )
     return p.returncode, p.stdout
