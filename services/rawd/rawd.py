@@ -7,33 +7,39 @@ import threading
 import subprocess
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
-
 from urllib.parse import urlparse, parse_qs
 
+import numpy as np
+
 # ---------------------------
-# Config
+# Config (lock to your proven-good behavior)
 # ---------------------------
 HTTP_PORT = int(os.environ.get("RAWD_HTTP_PORT", "8001"))
 
-CAM_W = int(os.environ.get("CAM_W", "1920"))
-CAM_H = int(os.environ.get("CAM_H", "1080"))
-CAM_MODE = int(os.environ.get("CAM_MODE", "2"))     # 1920x1080@~30 for IMX219
-BAYER = os.environ.get("CAM_BAYER", "RGGB")         # from your cam0.txt
-BITS = int(os.environ.get("CAM_BITS", "10"))        # from your cam0.txt
+# Capture resolution (raw Bayer). For IMX219 full-res mode 0 is typically 3264x2464.
+CAP_W = int(os.environ.get("CAP_W", "3264"))
+CAP_H = int(os.environ.get("CAP_H", "2464"))
+CAP_MODE = int(os.environ.get("CAP_MODE", "0"))         # you used --mode 0 successfully
+CAP_SKIPFRAMES = int(os.environ.get("RAWD_SKIPFRAMES", "2"))
+CAP_TIMEOUT_S = float(os.environ.get("RAWD_TIMEOUT_S", "6.0"))
+TARGET_FPS = float(os.environ.get("RAWD_FPS", "30.0"))
 
-# Where nvargus_nvraw writes files (use tmpfs for speed)
 TMPDIR = os.environ.get("RAWD_TMPDIR", "/dev/shm")
-CAP_SKIPFRAMES = int(os.environ.get("RAWD_SKIPFRAMES", "2"))  # small warm-up
-CAP_TIMEOUT_S = float(os.environ.get("RAWD_TIMEOUT_S", "5.0"))
 
-# Preview downsample factor (RAW only, pixel skipping)
-PREVIEW_DS = int(os.environ.get("RAWD_PREVIEW_DS", "4"))
+# Output sizes after rgb2x2 + preview subsample
+RGB_W = CAP_W // 2         # 1632
+RGB_H = CAP_H // 2         # 1232
+PREVIEW_W = RGB_W // 2     # 816
+PREVIEW_H = RGB_H // 2     # 616
+
+# Bayer format is assumed RGGB for the rgb2x2 block mapping.
+BAYER = os.environ.get("CAM_BAYER", "RGGB")
+BITS = int(os.environ.get("CAM_BITS", "10"))
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 def monotonic_ns():
-    # Python < 3.7 doesn't have time.monotonic_ns()
     if hasattr(time, "monotonic_ns"):
         return time.monotonic_ns()
     return int(time.monotonic() * 1e9)
@@ -41,177 +47,230 @@ def monotonic_ns():
 # ---------------------------
 # Storage
 # ---------------------------
-class LatestRawPair:
+class LatestRGBPair:
     """
-    Stores latest RAW Bayer frames for Left (cam0) and Right (cam1),
-    plus last UI->Jetson and Teensy->UI telemetry blobs.
+    Stores latest processed RGB2x2 frames for Left (cam0) and Right (cam1),
+    plus preview frames, plus timing stats.
     """
     def __init__(self):
         self._lock = threading.Lock()
         self.left = None   # dict
         self.right = None  # dict
-        self.ui_in = None      # last UI->Jetson data
-        self.teensy_in = None  # last Teensy->Jetson data (to forward to UI)
+        self.stats = {
+            "last_loop_ns": None,
+            "cam0_dt_ms": None,
+            "cam1_dt_ms": None,
+            "lr_dt_ms": None,
+            "fps_est": None,
+        }
 
-    def set_frame(self, side, item):
+    def set_pair(self, L, R, stats_update):
         with self._lock:
-            if side == "L":
-                self.left = item
-            else:
-                self.right = item
+            self.left = L
+            self.right = R
+            self.stats.update(stats_update)
 
     def get_pair(self):
         with self._lock:
-            L = self.left
-            R = self.right
-        if not L or not R:
-            return None
-        dt_ms = (L["t_mono_ns"] - R["t_mono_ns"]) / 1e6
-        return L, R, dt_ms
+            return self.left, self.right, dict(self.stats)
 
-    def set_ui_in(self, payload: bytes):
-        with self._lock:
-            self.ui_in = {"t_mono_ns": monotonic_ns(), "data": payload}
-
-    def get_ui_in(self):
-        with self._lock:
-            return self.ui_in
-
-    def set_teensy_in(self, payload: bytes):
-        with self._lock:
-            self.teensy_in = {"t_mono_ns": monotonic_ns(), "data": payload}
-
-    def get_teensy_in(self):
-        with self._lock:
-            return self.teensy_in
-
-store = LatestRawPair()
+store = LatestRGBPair()
 
 # ---------------------------
-# Capture helpers
+# Capture + decode helpers
 # ---------------------------
 def _capture_one(sensor_id: int, basepath: str):
-    """
-    Uses nvargus_nvraw to capture ONE raw frame (plus sidecar .txt).
-    Writes basepath.raw and basepath.txt.
-
-    Important: nvargus_nvraw "raw" output includes an extra embedded tail (13056 bytes in your case).
-    We will read only the first (W*H*2) bytes as the actual image plane (16-bit container for 10-bit values).
-    """
     cmd = [
         "nvargus_nvraw",
         "--c", str(sensor_id),
-        "--mode", str(CAM_MODE),
+        "--mode", str(CAP_MODE),
         "--format", "raw",
         "--file", basepath,
         "--skipframes", str(CAP_SKIPFRAMES),
     ]
-
-    # Must run as root (service will run as root)
     p = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        universal_newlines=True,
+        text=True,
         timeout=CAP_TIMEOUT_S,
     )
     return p.returncode, p.stdout
 
-def _read_raw_plane(raw_path: str):
-    img_bytes = CAM_W * CAM_H * 2      # 4147200 for 1920x1080
-    tail_bytes = 13056                 # hardcoded from your measurements
-
+def _read_raw_plane_bytes(raw_path: str) -> bytes:
+    img_bytes = CAP_W * CAP_H * 2
     with open(raw_path, "rb") as f:
         data = f.read()
-
     if len(data) < img_bytes:
         raise RuntimeError(f"RAW too small: {len(data)} < {img_bytes}")
+    # Ignore any tail/metadata by taking only the image plane
+    return data[:img_bytes]
 
-    # Optional: assert exact expected size (helps catch regressions)
-    if len(data) != img_bytes + tail_bytes:
-        print(f"[rawd] WARN: raw size {len(data)} != expected {img_bytes + tail_bytes}")
-
-    return data[:img_bytes]  
-
-
-
-def _downsample_raw16(plane: bytes, ds: int):
+def _rawplane_to_rgb2x2_rot180(plane_bytes: bytes) -> np.ndarray:
     """
-    Pixel skipping in RAW16 container (little endian).
-    Output is still RAW16 container, but with reduced width/height.
+    plane_bytes: little-endian u16 container, shape (CAP_H, CAP_W)
+    unpack: raw10 = (u16 >> 2) & 0x03FF
+    map RGGB 2x2 to RGB:
+      R = (0,0), G = avg((0,1),(1,0)), B = (1,1)
+    output: uint8 RGB, shape (RGB_H, RGB_W, 3)
+    rotate 180 degrees.
     """
-    if ds <= 1:
-        return plane, CAM_W, CAM_H
+    u16 = np.frombuffer(plane_bytes, dtype="<u2", count=CAP_W*CAP_H).reshape(CAP_H, CAP_W)
+    raw10 = ((u16 >> 2) & 0x03FF).astype(np.uint16)
 
-    w, h = CAM_W, CAM_H
-    nw, nh = w // ds, h // ds
-    out = bytearray(nw * nh * 2)
+    # RGGB blocks
+    R = raw10[0::2, 0::2]
+    G1 = raw10[0::2, 1::2]
+    G2 = raw10[1::2, 0::2]
+    B = raw10[1::2, 1::2]
+    G = ((G1.astype(np.uint32) + G2.astype(np.uint32)) // 2).astype(np.uint16)
 
-    # read/write 16-bit words, but keep as bytes
-    oi = 0
-    row_stride = w * 2
-    for r in range(0, h, ds):
-        rb = r * row_stride
-        for c in range(0, w, ds):
-            ib = rb + c * 2
-            out[oi:oi+2] = plane[ib:ib+2]
-            oi += 2
+    rgb16 = np.dstack([R, G, B]).astype(np.uint16)   # RGB order
+    rgb8 = (rgb16 >> 2).astype(np.uint8)            # 10->8
 
-    return bytes(out), nw, nh
+    # rotate 180: flip both axes
+    rgb8 = rgb8[::-1, ::-1, :]
+    return rgb8
+
+def _preview_from_rgb2x2(rgb8: np.ndarray) -> np.ndarray:
+    # subsample every 2 pixels in both directions -> 816x616
+    return rgb8[0::2, 0::2, :].copy()
 
 # ---------------------------
-# Capture worker (on-demand, but cached)
+# Capture loop thread
 # ---------------------------
-_capture_lock = threading.Lock()
+_stop_evt = threading.Event()
 
-def capture_pair(now: bool = True):
-    """
-    Captures both cameras (cam0=Left, cam1=Right), updates store.
-    Protected with a lock so multiple clients don't collide.
-    """
-    with _capture_lock:
-        t0 = monotonic_ns()
-        baseL = os.path.join(TMPDIR, "rawd_cam0")
-        baseR = os.path.join(TMPDIR, "rawd_cam1")
+def capture_loop():
+    os.makedirs(TMPDIR, exist_ok=True)
+    baseL = os.path.join(TMPDIR, "rawd_cam0")
+    baseR = os.path.join(TMPDIR, "rawd_cam1")
 
+    last_cam0_ns = None
+    last_cam1_ns = None
+    last_loop_ns = None
+
+    target_period_ns = int(1e9 / TARGET_FPS) if TARGET_FPS > 0 else 0
+
+    while not _stop_evt.is_set():
+        loop_start = monotonic_ns()
+
+        # Capture both cameras (sequential; simple + reliable)
         rc0, out0 = _capture_one(0, baseL)
-        tL = monotonic_ns()
+        t0 = monotonic_ns()
         rc1, out1 = _capture_one(1, baseR)
-        tR = monotonic_ns()
+        t1 = monotonic_ns()
 
-        # If capture failed, raise a useful error
         if rc0 != 0 or rc1 != 0:
-            raise RuntimeError(
-                "nvargus_nvraw failed:\n"
-                f"cam0 rc={rc0}\n{out0}\n"
-                f"cam1 rc={rc1}\n{out1}\n"
-            )
+            # Don’t crash the daemon—store error in stats and continue
+            err = f"cam0 rc={rc0} cam1 rc={rc1}"
+            print("[rawd] capture error:", err)
+            print("[rawd] cam0 output:\n", out0)
+            print("[rawd] cam1 output:\n", out1)
+            # small backoff
+            time.sleep(0.2)
+            continue
 
-        rawL = _read_raw_plane(baseL + ".raw")
-        rawR = _read_raw_plane(baseR + ".raw")
+        try:
+            rawL = _read_raw_plane_bytes(baseL + ".raw")
+            rawR = _read_raw_plane_bytes(baseR + ".raw")
+            rgbL = _rawplane_to_rgb2x2_rot180(rawL)
+            rgbR = _rawplane_to_rgb2x2_rot180(rawR)
+            prevL = _preview_from_rgb2x2(rgbL)
+            prevR = _preview_from_rgb2x2(rgbR)
+        except Exception as e:
+            print("[rawd] decode error:", e)
+            time.sleep(0.1)
+            continue
 
-        store.set_frame("L", {
-            "w": CAM_W, "h": CAM_H, "bits": BITS, "bayer": BAYER,
-            "t_mono_ns": tL, "t_wall": time.time(),
-            "raw16": rawL,
+        # Timing stats
+        cam0_dt_ms = None
+        cam1_dt_ms = None
+        if last_cam0_ns is not None:
+            cam0_dt_ms = (t0 - last_cam0_ns) / 1e6
+        if last_cam1_ns is not None:
+            cam1_dt_ms = (t1 - last_cam1_ns) / 1e6
+
+        lr_dt_ms = (t1 - t0) / 1e6
+
+        fps_est = None
+        if last_loop_ns is not None:
+            loop_dt_s = (loop_start - last_loop_ns) / 1e9
+            if loop_dt_s > 0:
+                fps_est = 1.0 / loop_dt_s
+
+        last_cam0_ns = t0
+        last_cam1_ns = t1
+        last_loop_ns = loop_start
+
+        L = {
+            "cam": 0,
+            "t_mono_ns": t0,
+            "t_wall": time.time(),
+            "w": RGB_W, "h": RGB_H,
+            "rgb": rgbL,          # numpy uint8
+            "preview": prevL,     # numpy uint8
+        }
+        R = {
+            "cam": 1,
+            "t_mono_ns": t1,
+            "t_wall": time.time(),
+            "w": RGB_W, "h": RGB_H,
+            "rgb": rgbR,
+            "preview": prevR,
+        }
+
+        store.set_pair(L, R, {
+            "last_loop_ns": loop_start,
+            "cam0_dt_ms": cam0_dt_ms,
+            "cam1_dt_ms": cam1_dt_ms,
+            "lr_dt_ms": lr_dt_ms,
+            "fps_est": fps_est,
         })
-        store.set_frame("R", {
-            "w": CAM_W, "h": CAM_H, "bits": BITS, "bayer": BAYER,
-            "t_mono_ns": tR, "t_wall": time.time(),
-            "raw16": rawR,
-        })
-        return (monotonic_ns() - t0) / 1e9
+
+        # Sleep to target FPS if we’re faster than target (usually we won’t be)
+        if target_period_ns > 0:
+            elapsed_ns = monotonic_ns() - loop_start
+            remain_ns = target_period_ns - elapsed_ns
+            if remain_ns > 0:
+                time.sleep(remain_ns / 1e9)
 
 # ---------------------------
-# HTTP API
+# HTTP API (binary packets)
 # ---------------------------
-# Snapshot binary format:
-# [u32le header_len][header_json][payload]
-#
-# /snapshot payload: L_raw16 + R_raw16
-# /preview payload:  L_raw16_ds + R_raw16_ds   (ds=RAWD_PREVIEW_DS)
-#
-# header includes sizes, timestamps, dt_ms, and bayer/bits.
+# Binary format:
+# [u32le header_len][header_json_utf8][payload]
+# payload for /rgb:     L_rgb + R_rgb (uint8, RGB interleaved)
+# payload for /preview: L_prev + R_prev
+
+def pack_frame_pair(L, R, kind: str):
+    if kind == "rgb":
+        A = L["rgb"]
+        B = R["rgb"]
+        w, h = RGB_W, RGB_H
+    elif kind == "preview":
+        A = L["preview"]
+        B = R["preview"]
+        w, h = PREVIEW_W, PREVIEW_H
+    else:
+        raise ValueError("bad kind")
+
+    payloadA = A.tobytes(order="C")
+    payloadB = B.tobytes(order="C")
+    payload = payloadA + payloadB
+
+    header = {
+        "format": "RGB_U8_INTERLEAVED",
+        "kind": kind,
+        "bayer_assumed": BAYER,
+        "bits": BITS,
+        "capture": {"w": CAP_W, "h": CAP_H, "mode": CAP_MODE},
+        "out": {"w": w, "h": h, "channels": 3},
+        "L": {"t_mono_ns": L["t_mono_ns"], "t_wall": L["t_wall"], "len": len(payloadA)},
+        "R": {"t_mono_ns": R["t_mono_ns"], "t_wall": R["t_wall"], "len": len(payloadB)},
+    }
+    hbytes = json.dumps(header).encode("utf-8")
+    return struct.pack("<I", len(hbytes)) + hbytes + payload
 
 class Handler(BaseHTTPRequestHandler):
     def _send_json(self, code: int, obj):
@@ -222,74 +281,31 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
-    def _read_body(self):
-        n = int(self.headers.get("Content-Length", "0"))
-        return self.rfile.read(n) if n > 0 else b""
-
     def do_GET(self):
         u = urlparse(self.path)
         path = u.path
-        qs = parse_qs(u.query)
 
         if path == "/status":
-            pair = store.get_pair()
-            ui_in = store.get_ui_in()
-            teensy_in = store.get_teensy_in()
+            L, R, st = store.get_pair()
             out = {
                 "ok": True,
-                "have_pair": pair is not None,
-                "cam": {"w": CAM_W, "h": CAM_H, "mode": CAM_MODE, "bayer": BAYER, "bits": BITS},
-                "ui_in": None if not ui_in else {"t_mono_ns": ui_in["t_mono_ns"], "len": len(ui_in["data"])},
-                "teensy_in": None if not teensy_in else {"t_mono_ns": teensy_in["t_mono_ns"], "len": len(teensy_in["data"])},
+                "have_pair": bool(L and R),
+                "capture": {"w": CAP_W, "h": CAP_H, "mode": CAP_MODE},
+                "out": {"rgb_w": RGB_W, "rgb_h": RGB_H, "prev_w": PREVIEW_W, "prev_h": PREVIEW_H},
+                "stats": st,
             }
-            if pair:
-                L, R, dt_ms = pair
-                out["dt_ms"] = dt_ms
+            if L and R:
                 out["L"] = {"t_mono_ns": L["t_mono_ns"], "t_wall": L["t_wall"]}
                 out["R"] = {"t_mono_ns": R["t_mono_ns"], "t_wall": R["t_wall"]}
             self._send_json(200, out)
             return
 
-        if path == "/capture":
-            # Triggers an immediate capture and returns timing
-            try:
-                sec = capture_pair()
-                self._send_json(200, {"ok": True, "capture_s": sec})
-            except Exception as e:
-                self._send_json(500, {"ok": False, "error": str(e)})
-            return
-
-        if path == "/snapshot":
-            # Ensure we have fresh frames if requested
-            force = qs.get("force", ["0"])[0] == "1"
-            if force or store.get_pair() is None:
-                try:
-                    capture_pair()
-                except Exception as e:
-                    self._send_json(500, {"ok": False, "error": str(e)})
-                    return
-
-            pair = store.get_pair()
-            if pair is None:
-                self._send_json(503, {"ok": False, "reason": "no_frames"})
+        if path == "/rgb":
+            L, R, _ = store.get_pair()
+            if not L or not R:
+                self._send_json(503, {"ok": False, "reason": "no_frames_yet"})
                 return
-
-            L, R, dt_ms = pair
-            header = {
-                "format": "BAYER_RAW16_CONTAINER",
-                "bayer": BAYER,
-                "bits": BITS,
-                "mode": CAM_MODE,
-                "dt_ms": dt_ms,
-                "L": {"w": CAM_W, "h": CAM_H, "t_mono_ns": L["t_mono_ns"], "len": len(L["raw16"])},
-                "R": {"w": CAM_W, "h": CAM_H, "t_mono_ns": R["t_mono_ns"], "len": len(R["raw16"])},
-                "embedded_tail_bytes": 13056,
-                "embedded_top_lines": 6,
-            }
-            hbytes = json.dumps(header).encode("utf-8")
-            payload = L["raw16"] + R["raw16"]
-            out = struct.pack("<I", len(hbytes)) + hbytes + payload
-
+            out = pack_frame_pair(L, R, "rgb")
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(len(out)))
@@ -298,38 +314,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/preview":
-            # Returns a downsampled RAW pair for cheap UI preview (still Bayer RAW16 container)
-            force = qs.get("force", ["0"])[0] == "1"
-            if force or store.get_pair() is None:
-                try:
-                    capture_pair()
-                except Exception as e:
-                    self._send_json(500, {"ok": False, "error": str(e)})
-                    return
-
-            pair = store.get_pair()
-            if pair is None:
-                self._send_json(503, {"ok": False, "reason": "no_frames"})
+            L, R, _ = store.get_pair()
+            if not L or not R:
+                self._send_json(503, {"ok": False, "reason": "no_frames_yet"})
                 return
-
-            L, R, dt_ms = pair
-            Lds, wds, hds = _downsample_raw16(L["raw16"], PREVIEW_DS)
-            Rds, _, _ = _downsample_raw16(R["raw16"], PREVIEW_DS)
-
-            header = {
-                "format": "BAYER_RAW16_CONTAINER",
-                "bayer": BAYER,
-                "bits": BITS,
-                "mode": CAM_MODE,
-                "dt_ms": dt_ms,
-                "ds": PREVIEW_DS,
-                "L": {"w": wds, "h": hds, "t_mono_ns": L["t_mono_ns"], "len": len(Lds)},
-                "R": {"w": wds, "h": hds, "t_mono_ns": R["t_mono_ns"], "len": len(Rds)},
-            }
-            hbytes = json.dumps(header).encode("utf-8")
-            payload = Lds + Rds
-            out = struct.pack("<I", len(hbytes)) + hbytes + payload
-
+            out = pack_frame_pair(L, R, "preview")
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(len(out)))
@@ -337,96 +326,28 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(out)
             return
 
-        # Telemetry fetch endpoints
-        if path == "/telemetry/ui_in":
-            item = store.get_ui_in()
-            if not item:
-                self._send_json(200, {"ok": True, "have": False})
-            else:
-                # return as base64? nope: return raw bytes in /telemetry/ui_in.bin
-                self._send_json(200, {"ok": True, "have": True, "t_mono_ns": item["t_mono_ns"], "len": len(item["data"])})
-            return
-
-        if path == "/telemetry/teensy_in":
-            item = store.get_teensy_in()
-            if not item:
-                self._send_json(200, {"ok": True, "have": False})
-            else:
-                self._send_json(200, {"ok": True, "have": True, "t_mono_ns": item["t_mono_ns"], "len": len(item["data"])})
-            return
-
-        # Telemetry raw binary get (so scripts can read exactly what was posted)
-        if path == "/telemetry/ui_in.bin":
-            item = store.get_ui_in()
-            if not item:
-                self.send_response(204); self.end_headers(); return
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(len(item["data"])))
-            self.end_headers()
-            self.wfile.write(item["data"])
-            return
-
-        if path == "/telemetry/teensy_in.bin":
-            item = store.get_teensy_in()
-            if not item:
-                self.send_response(204); self.end_headers(); return
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(len(item["data"])))
-            self.end_headers()
-            self.wfile.write(item["data"])
-            return
-
-        self.send_response(404)
-        self.end_headers()
-
-    def do_POST(self):
-        u = urlparse(self.path)
-        path = u.path
-        body = self._read_body()
-
-        # UI -> Jetson commands / telemetry
-        if path == "/telemetry/ui_in":
-            store.set_ui_in(body)
-            self._send_json(200, {"ok": True, "stored": len(body)})
-            return
-
-        # Teensy bridge -> Jetson (to forward to UI)
-        if path == "/telemetry/teensy_in":
-            store.set_teensy_in(body)
-            self._send_json(200, {"ok": True, "stored": len(body)})
-            return
-
         self.send_response(404)
         self.end_headers()
 
 def main():
-    print(f"[rawd] RAW snapshot server on http://0.0.0.0:{HTTP_PORT}", flush=True)
-    print("[rawd] Endpoints:", flush=True)
-    print("  GET  /status", flush=True)
-    print("  GET  /capture", flush=True)
-    print("  GET  /snapshot?force=1", flush=True)
-    print("  GET  /preview?force=1", flush=True)
-    print("  POST /telemetry/ui_in    (UI->Jetson bytes)", flush=True)
-    print("  POST /telemetry/teensy_in (Teensy->UI bytes)", flush=True)
+    print(f"[rawd] starting capture loop (target_fps={TARGET_FPS})", flush=True)
+    th = threading.Thread(target=capture_loop, daemon=True)
+    th.start()
 
-    try:
-        httpd = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
-    except Exception as e:
-        print(f"[rawd] FATAL: cannot bind HTTP server on port {HTTP_PORT}: {e}", flush=True)
-        raise
+    print(f"[rawd] HTTP on 0.0.0.0:{HTTP_PORT}", flush=True)
+    print("[rawd] GET /status, /rgb, /preview", flush=True)
 
+    httpd = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        _stop_evt.set()
         try:
             httpd.server_close()
         except Exception:
             pass
-
 
 if __name__ == "__main__":
     main()
