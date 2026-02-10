@@ -92,7 +92,7 @@ def _capture_one(sensor_id: int, basepath: str):
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
+        universal_newlines=True,
         timeout=CAP_TIMEOUT_S,
     )
     return p.returncode, p.stdout
@@ -153,87 +153,94 @@ def capture_loop():
     target_period_ns = int(1e9 / TARGET_FPS) if TARGET_FPS > 0 else 0
 
     while not _stop_evt.is_set():
-        loop_start = monotonic_ns()
-
-        # Capture both cameras (sequential; simple + reliable)
-        rc0, out0 = _capture_one(0, baseL)
-        t0 = monotonic_ns()
-        rc1, out1 = _capture_one(1, baseR)
-        t1 = monotonic_ns()
-
-        if rc0 != 0 or rc1 != 0:
-            # Don’t crash the daemon—store error in stats and continue
-            err = f"cam0 rc={rc0} cam1 rc={rc1}"
-            print("[rawd] capture error:", err)
-            print("[rawd] cam0 output:\n", out0)
-            print("[rawd] cam1 output:\n", out1)
-            # small backoff
-            time.sleep(0.2)
-            continue
-
         try:
-            rawL = _read_raw_plane_bytes(baseL + ".raw")
-            rawR = _read_raw_plane_bytes(baseR + ".raw")
-            rgbL = _rawplane_to_rgb2x2_rot180(rawL)
-            rgbR = _rawplane_to_rgb2x2_rot180(rawR)
-            prevL = _preview_from_rgb2x2(rgbL)
-            prevR = _preview_from_rgb2x2(rgbR)
+            loop_start = monotonic_ns()
+
+            # Capture both cameras (sequential; simple + reliable)
+            rc0, out0 = _capture_one(0, baseL)
+            t0 = monotonic_ns()
+            rc1, out1 = _capture_one(1, baseR)
+            t1 = monotonic_ns()
+
+            if rc0 != 0 or rc1 != 0:
+                # Don’t crash the daemon—store error in stats and continue
+                err = f"cam0 rc={rc0} cam1 rc={rc1}"
+                print("[rawd] capture error:", err, flush=True)
+                print("[rawd] cam0 output:\n", out0, flush=True)
+                print("[rawd] cam1 output:\n", out1, flush=True)
+                # small backoff
+                time.sleep(0.2)
+                continue
+
+            try:
+                rawL = _read_raw_plane_bytes(baseL + ".raw")
+                rawR = _read_raw_plane_bytes(baseR + ".raw")
+                rgbL = _rawplane_to_rgb2x2_rot180(rawL)
+                rgbR = _rawplane_to_rgb2x2_rot180(rawR)
+                prevL = _preview_from_rgb2x2(rgbL)
+                prevR = _preview_from_rgb2x2(rgbR)
+            except Exception as e:
+                print("[rawd] decode error:", e, flush=True)
+                time.sleep(0.1)
+                continue
+
+            # Timing stats
+            cam0_dt_ms = None
+            cam1_dt_ms = None
+            if last_cam0_ns is not None:
+                cam0_dt_ms = (t0 - last_cam0_ns) / 1e6
+            if last_cam1_ns is not None:
+                cam1_dt_ms = (t1 - last_cam1_ns) / 1e6
+
+            lr_dt_ms = (t1 - t0) / 1e6
+
+            fps_est = None
+            if last_loop_ns is not None:
+                loop_dt_s = (loop_start - last_loop_ns) / 1e9
+                if loop_dt_s > 0:
+                    fps_est = 1.0 / loop_dt_s
+
+            last_cam0_ns = t0
+            last_cam1_ns = t1
+            last_loop_ns = loop_start
+
+            L = {
+                "cam": 0,
+                "t_mono_ns": t0,
+                "t_wall": time.time(),
+                "w": RGB_W, "h": RGB_H,
+                "rgb": rgbL,          # numpy uint8
+                "preview": prevL,     # numpy uint8
+            }
+            R = {
+                "cam": 1,
+                "t_mono_ns": t1,
+                "t_wall": time.time(),
+                "w": RGB_W, "h": RGB_H,
+                "rgb": rgbR,
+                "preview": prevR,
+            }
+
+            store.set_pair(L, R, {
+                "last_loop_ns": loop_start,
+                "cam0_dt_ms": cam0_dt_ms,
+                "cam1_dt_ms": cam1_dt_ms,
+                "lr_dt_ms": lr_dt_ms,
+                "fps_est": fps_est,
+            })
+
+            # Sleep to target FPS if we’re faster than target (usually we won’t be)
+            if target_period_ns > 0:
+                elapsed_ns = monotonic_ns() - loop_start
+                remain_ns = target_period_ns - elapsed_ns
+                if remain_ns > 0:
+                    time.sleep(remain_ns / 1e9)
         except Exception as e:
-            print("[rawd] decode error:", e)
-            time.sleep(0.1)
+            import traceback
+            print("[rawd] FATAL capture_loop exception:", e, flush=True)
+            traceback.print_exc()
+            time.sleep(0.5)
             continue
-
-        # Timing stats
-        cam0_dt_ms = None
-        cam1_dt_ms = None
-        if last_cam0_ns is not None:
-            cam0_dt_ms = (t0 - last_cam0_ns) / 1e6
-        if last_cam1_ns is not None:
-            cam1_dt_ms = (t1 - last_cam1_ns) / 1e6
-
-        lr_dt_ms = (t1 - t0) / 1e6
-
-        fps_est = None
-        if last_loop_ns is not None:
-            loop_dt_s = (loop_start - last_loop_ns) / 1e9
-            if loop_dt_s > 0:
-                fps_est = 1.0 / loop_dt_s
-
-        last_cam0_ns = t0
-        last_cam1_ns = t1
-        last_loop_ns = loop_start
-
-        L = {
-            "cam": 0,
-            "t_mono_ns": t0,
-            "t_wall": time.time(),
-            "w": RGB_W, "h": RGB_H,
-            "rgb": rgbL,          # numpy uint8
-            "preview": prevL,     # numpy uint8
-        }
-        R = {
-            "cam": 1,
-            "t_mono_ns": t1,
-            "t_wall": time.time(),
-            "w": RGB_W, "h": RGB_H,
-            "rgb": rgbR,
-            "preview": prevR,
-        }
-
-        store.set_pair(L, R, {
-            "last_loop_ns": loop_start,
-            "cam0_dt_ms": cam0_dt_ms,
-            "cam1_dt_ms": cam1_dt_ms,
-            "lr_dt_ms": lr_dt_ms,
-            "fps_est": fps_est,
-        })
-
-        # Sleep to target FPS if we’re faster than target (usually we won’t be)
-        if target_period_ns > 0:
-            elapsed_ns = monotonic_ns() - loop_start
-            remain_ns = target_period_ns - elapsed_ns
-            if remain_ns > 0:
-                time.sleep(remain_ns / 1e9)
 
 # ---------------------------
 # HTTP API (binary packets)
